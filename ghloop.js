@@ -232,25 +232,49 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
 
 // --- Watch strategies ---
 
-/** Spawns `gh pr checks --watch` and resolves when it exits (CI finished or changed) */
-function watchChecksViaGh(prNumber) {
+/**
+ * Spawns `gh pr checks --watch` and resolves only when checks actually change.
+ * If checks are already in a terminal state and --watch exits immediately,
+ * we detect that nothing changed and restart the watch instead of winning the race.
+ */
+function watchChecksViaGh(prNumber, baselineChecks) {
   return new Promise((resolve) => {
-    const child = spawn('gh', ['pr', 'checks', prNumber, '--watch', '--fail-fast'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('close', (code) => {
-      // Exit code 0 = all passed, 1 = some failed, 8 = still pending (shouldn't happen with --watch)
-      resolve({ source: 'checks', code });
-    });
-    child.on('error', () => {
-      // gh pr checks --watch not available or failed — fall back silently
-      resolve({ source: 'checks', code: -1 });
-    });
-    // Store for cleanup
-    watchChecksViaGh._child = child;
+    function startWatch() {
+      const child = spawn('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', d => { stderr += d; });
+      child.on('close', (code) => {
+        if (code !== 0 && stderr) {
+          console.error(`gh pr checks --watch exited with code ${code}: ${stderr.trim()}`);
+        }
+        // Check if checks actually changed
+        const currentChecks = fetchChecks(prNumber);
+        const changed = checksDiffer(baselineChecks, currentChecks);
+        if (changed) {
+          resolve({ source: 'checks', code, checks: currentChecks });
+        }
+        // If unchanged (checks were already terminal), don't resolve —
+        // let comment polling win or wait for a new push to trigger checks
+      });
+      child.on('error', () => {
+        // gh pr checks --watch not available — never resolve, let comment polling handle it
+      });
+      watchChecksViaGh._child = child;
+    }
+    startWatch();
   });
+}
+
+function checksDiffer(a, b) {
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].state !== b[i].state) return true;
+    if (a[i].name !== b[i].name) return true;
+    if (a[i].workflow !== b[i].workflow) return true;
+  }
+  return false;
 }
 
 /** Polls comment counts until they change from baseline */
@@ -326,7 +350,7 @@ async function main() {
 
   // Race: gh pr checks --watch vs comment polling
   const result = await Promise.race([
-    watchChecksViaGh(String(prNumber)),
+    watchChecksViaGh(prNumber, currentState.checks),
     watchComments(prNumber, repo, currentState.comments, args.interval),
   ]);
 
