@@ -1,0 +1,14 @@
+{
+  "name": "ghloop",
+  "version": "1.0.0",
+  "description": "Watch GitHub PRs for CI status changes and new comments",
+  "main": "ghloop.js",
+  "bin": {
+    "ghloop": "./ghloop.js"
+  },
+  "scripts": {
+    "start": "node ghloop.js"
+  },
+  "keywords": ["github", "pr", "watch", "ci"],
+  "license": "ISC"
+}
