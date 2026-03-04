@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const { execSync, spawn } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -43,6 +43,7 @@ Options:
     i++;
   }
   if (isNaN(args.interval) || args.interval < 1) die('Interval must be a positive integer');
+  if (args.pr && !/^\d+$/.test(args.pr)) die('PR number must be numeric');
   return args;
 }
 
@@ -53,19 +54,11 @@ function die(msg) {
   process.exit(1);
 }
 
-function gh(cmd) {
+function run(cmd, args) {
   try {
-    return execSync(`gh ${cmd}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
   } catch (e) {
-    die(`gh command failed: gh ${cmd}\n${e.stderr || e.message}`);
-  }
-}
-
-function git(cmd) {
-  try {
-    return execSync(`git ${cmd}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-  } catch (e) {
-    die(`git command failed: git ${cmd}\n${e.stderr || e.message}`);
+    die(`command failed: ${cmd} ${args.join(' ')}\n${e.stderr || e.message}`);
   }
 }
 
@@ -77,16 +70,16 @@ function sleep(seconds) {
 
 function resolvePr(prArg) {
   if (prArg) return prArg;
-  const branch = git('rev-parse --abbrev-ref HEAD');
+  const branch = run('git', ['rev-parse', '--abbrev-ref', 'HEAD']);
   if (branch === 'HEAD') die('Detached HEAD; provide --pr <number>');
-  const num = gh(`pr list --head "${branch}" --state open --limit 1 --json number --jq ".[0].number // empty"`);
+  const num = run('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--limit', '1', '--json', 'number', '--jq', '.[0].number // empty']);
   if (!num) die(`No open PR found for branch: ${branch}`);
   return num;
 }
 
 function fetchChecks(prNumber) {
   try {
-    const raw = execSync(`gh pr checks ${prNumber} --json name,state,workflow`, {
+    const raw = execFileSync('gh', ['pr', 'checks', String(prNumber), '--json', 'name,state,workflow'], {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
@@ -99,14 +92,14 @@ function fetchChecks(prNumber) {
 }
 
 function fetchCommentCounts(prNumber, repo) {
-  const apiJson = JSON.parse(gh(`api repos/${repo}/pulls/${prNumber}`));
+  const apiJson = JSON.parse(run('gh', ['api', `repos/${repo}/pulls/${prNumber}`]));
   const issue = apiJson.comments || 0;
   const review = apiJson.review_comments || 0;
   return { issue, review, total: issue + review };
 }
 
 function fetchState(prNumber, repo) {
-  const viewJson = JSON.parse(gh(`pr view ${prNumber} --json title,url`));
+  const viewJson = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '--json', 'title,url']));
   const comments = fetchCommentCounts(prNumber, repo);
   const checks = fetchChecks(prNumber);
 
@@ -125,11 +118,15 @@ function statesDiffer(a, b) {
   if (a.comments.total !== b.comments.total) return true;
   if (a.comments.issue !== b.comments.issue) return true;
   if (a.comments.review !== b.comments.review) return true;
-  if (a.checks.length !== b.checks.length) return true;
-  for (let i = 0; i < a.checks.length; i++) {
-    if (a.checks[i].state !== b.checks[i].state) return true;
-    if (a.checks[i].name !== b.checks[i].name) return true;
-    if (a.checks[i].workflow !== b.checks[i].workflow) return true;
+  return checksDiffer(a.checks, b.checks);
+}
+
+function checksDiffer(a, b) {
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].state !== b[i].state) return true;
+    if (a[i].name !== b[i].name) return true;
+    if (a[i].workflow !== b[i].workflow) return true;
   }
   return false;
 }
@@ -182,7 +179,7 @@ function printChanges(oldState, newState) {
 function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
   let prComments = [];
   try {
-    const raw = gh(`pr view ${prNumber} --json comments --jq '.comments[]?'`);
+    const raw = run('gh', ['pr', 'view', String(prNumber), '--json', 'comments', '--jq', '.comments[]?']);
     if (raw) prComments = raw.split('\n').filter(Boolean).map(line => JSON.parse(line));
   } catch { /* empty */ }
 
@@ -191,7 +188,7 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
 
   let reviewComments = [];
   try {
-    reviewComments = JSON.parse(gh(`api --paginate repos/${repo}/pulls/${prNumber}/comments`));
+    reviewComments = JSON.parse(run('gh', ['api', '--paginate', `repos/${repo}/pulls/${prNumber}/comments`]));
   } catch { /* empty */ }
   const newReviewComments = reviewComments.filter(c => new Date(c.created_at) > since);
 
@@ -235,46 +232,30 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
 /**
  * Spawns `gh pr checks --watch` and resolves only when checks actually change.
  * If checks are already in a terminal state and --watch exits immediately,
- * we detect that nothing changed and restart the watch instead of winning the race.
+ * we detect that nothing changed and don't resolve — letting comment polling continue.
  */
 function watchChecksViaGh(prNumber, baselineChecks) {
   return new Promise((resolve) => {
-    function startWatch() {
-      const child = spawn('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stderr = '';
-      child.stderr.on('data', d => { stderr += d; });
-      child.on('close', (code) => {
-        if (code !== 0 && stderr) {
-          console.error(`gh pr checks --watch exited with code ${code}: ${stderr.trim()}`);
-        }
-        // Check if checks actually changed
-        const currentChecks = fetchChecks(prNumber);
-        const changed = checksDiffer(baselineChecks, currentChecks);
-        if (changed) {
-          resolve({ source: 'checks', code, checks: currentChecks });
-        }
-        // If unchanged (checks were already terminal), don't resolve —
-        // let comment polling win or wait for a new push to trigger checks
-      });
-      child.on('error', () => {
-        // gh pr checks --watch not available — never resolve, let comment polling handle it
-      });
-      watchChecksViaGh._child = child;
-    }
-    startWatch();
+    const child = spawn('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('close', (code) => {
+      if (code !== 0 && stderr) {
+        console.error(`gh pr checks --watch exited with code ${code}: ${stderr.trim()}`);
+      }
+      const currentChecks = fetchChecks(prNumber);
+      if (checksDiffer(baselineChecks, currentChecks)) {
+        resolve({ source: 'checks', code, checks: currentChecks });
+      }
+      // If unchanged, don't resolve — let comment polling handle it
+    });
+    child.on('error', () => {
+      // gh pr checks --watch not available — never resolve, let comment polling handle it
+    });
+    watchChecksViaGh._child = child;
   });
-}
-
-function checksDiffer(a, b) {
-  if (a.length !== b.length) return true;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].state !== b[i].state) return true;
-    if (a[i].name !== b[i].name) return true;
-    if (a[i].workflow !== b[i].workflow) return true;
-  }
-  return false;
 }
 
 /** Polls comment counts until they change from baseline */
@@ -306,11 +287,11 @@ function cleanup() {
 async function main() {
   const args = parseArgs(process.argv);
   const prNumber = resolvePr(args.pr);
-  const repo = JSON.parse(gh('repo view --json nameWithOwner')).nameWithOwner;
+  const repo = JSON.parse(run('gh', ['repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner;
 
   let stateDir = args.stateDir;
   if (!stateDir) {
-    const gitCommonDir = git('rev-parse --git-common-dir');
+    const gitCommonDir = run('git', ['rev-parse', '--git-common-dir']);
     stateDir = path.join(gitCommonDir, 'ghloop');
   }
   fs.mkdirSync(stateDir, { recursive: true });
@@ -359,19 +340,12 @@ async function main() {
   // Fetch full final state for accurate diff
   const finalState = fetchState(prNumber, repo);
 
-  if (statesDiffer(currentState, finalState)) {
-    console.log(`Update detected at ${new Date().toISOString()}`);
-    printChanges(currentState, finalState);
-    if (finalState.comments.total > currentState.comments.total) {
-      fetchAndPrintNewComments(prNumber, repo, currentState.fetchedAt);
-    }
-    fs.writeFileSync(stateFile, JSON.stringify(finalState, null, 2));
-  } else {
-    // gh pr checks --watch exited but state looks the same (e.g. checks were already done)
-    console.log(`CI watcher exited (code ${result.code}) but no state diff detected.`);
-    fs.writeFileSync(stateFile, JSON.stringify(finalState, null, 2));
+  console.log(`Update detected at ${new Date().toISOString()}`);
+  printChanges(currentState, finalState);
+  if (finalState.comments.total > currentState.comments.total) {
+    fetchAndPrintNewComments(prNumber, repo, currentState.fetchedAt);
   }
-
+  fs.writeFileSync(stateFile, JSON.stringify(finalState, null, 2));
   process.exit(0);
 }
 
