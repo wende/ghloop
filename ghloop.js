@@ -201,16 +201,20 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
 
   for (const c of newPrComments) {
     console.log('');
+    console.log(`ID: ${c.id}`);
     console.log(`Author: ${c.author?.login || 'unknown'}`);
     console.log(`Date: ${c.createdAt}`);
     if (c.url) console.log(`URL: ${c.url}`);
     console.log('');
     console.log(c.body);
+    console.log('');
+    console.log(`Reply: gh api graphql -f query='mutation { addComment(input: {subjectId: "${c.id}", body: "..."}) { commentEdge { node { id } } } }'`);
     console.log('\u2500'.repeat(80));
   }
 
   for (const c of newReviewComments) {
     console.log('');
+    console.log(`ID: ${c.id}`);
     console.log(`File: ${c.path}:${c.line || c.original_line || 'N/A'}`);
     console.log(`Author: ${c.user?.login || 'unknown'}`);
     console.log(`Date: ${c.created_at}`);
@@ -223,6 +227,8 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
     }
     console.log('');
     console.log(c.body);
+    console.log('');
+    console.log(`Reply: gh api repos/${repo}/pulls/${prNumber}/comments -f body="..." -F in_reply_to_id=${c.id}`);
     console.log('\u2500'.repeat(80));
   }
 }
