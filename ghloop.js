@@ -8,7 +8,7 @@ const path = require('path');
 // --- CLI parsing ---
 
 function parseArgs(argv) {
-  const args = { pr: '', interval: 15, stateDir: '' };
+  const args = { pr: '', interval: 15, stateDir: '', loop: false };
   let i = 2;
   while (i < argv.length) {
     switch (argv[i]) {
@@ -23,9 +23,13 @@ function parseArgs(argv) {
       case '--state-dir':
         args.stateDir = argv[++i];
         break;
+      case '--loop':
+      case '-l':
+        args.loop = true;
+        break;
       case '--help':
       case '-h':
-        console.log(`Usage: ghloop [--pr <number>] [--interval <seconds>] [--state-dir <path>]
+        console.log(`Usage: ghloop [--pr <number>] [--interval <seconds>] [--loop] [--state-dir <path>]
 
 Watches a GitHub PR for CI status changes and new comments.
 Uses "gh pr checks --watch" for CI (no polling) and polls for new comments.
@@ -33,6 +37,7 @@ Uses "gh pr checks --watch" for CI (no polling) and polls for new comments.
 Options:
   -p, --pr <number>        PR number (default: auto-detect from current branch)
   -i, --interval <seconds> Comment poll interval in seconds (default: 15)
+  -l, --loop               Stay running after detecting changes instead of exiting
       --state-dir <path>   State persistence directory (default: <git-dir>/ghloop/)
   -h, --help               Show this help`);
         process.exit(0);
@@ -79,12 +84,12 @@ function resolvePr(prArg) {
 
 function fetchChecks(prNumber) {
   try {
-    const raw = execFileSync('gh', ['pr', 'checks', String(prNumber), '--json', 'name,state,workflow'], {
+    const raw = execFileSync('gh', ['pr', 'checks', String(prNumber), '--json', 'name,state,workflow,link'], {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
     return JSON.parse(raw || '[]')
-      .map(c => ({ workflow: c.workflow || '', name: c.name || '', state: c.state || '' }))
+      .map(c => ({ workflow: c.workflow || '', name: c.name || '', state: c.state || '', link: c.link || '' }))
       .sort((a, b) => (a.workflow + a.name).localeCompare(b.workflow + b.name));
   } catch {
     return [];
@@ -99,7 +104,7 @@ function fetchCommentCounts(prNumber, repo) {
 }
 
 function fetchState(prNumber, repo) {
-  const viewJson = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '--json', 'title,url']));
+  const viewJson = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '--json', 'title,url,state']));
   const comments = fetchCommentCounts(prNumber, repo);
   const checks = fetchChecks(prNumber);
 
@@ -109,12 +114,14 @@ function fetchState(prNumber, repo) {
     prNumber,
     prTitle: viewJson.title,
     prUrl: viewJson.url,
+    prState: viewJson.state || 'OPEN',
     comments,
     checks,
   };
 }
 
 function statesDiffer(a, b) {
+  if ((a.prState || 'OPEN') !== (b.prState || 'OPEN')) return true;
   if (a.comments.total !== b.comments.total) return true;
   if (a.comments.issue !== b.comments.issue) return true;
   if (a.comments.review !== b.comments.review) return true;
@@ -127,6 +134,7 @@ function checksDiffer(a, b) {
     if (a[i].state !== b[i].state) return true;
     if (a[i].name !== b[i].name) return true;
     if (a[i].workflow !== b[i].workflow) return true;
+    if (a[i].link !== b[i].link) return true;
   }
   return false;
 }
@@ -145,6 +153,10 @@ function printSummary(state) {
 
 function printChanges(oldState, newState) {
   const changes = [];
+  const oldPrState = oldState.prState || 'OPEN';
+  const newPrState = newState.prState || 'OPEN';
+  if (oldPrState !== newPrState)
+    changes.push(`- PR state: ${oldPrState} -> ${newPrState}`);
   if (oldState.comments.total !== newState.comments.total)
     changes.push(`- Total comments: ${oldState.comments.total} -> ${newState.comments.total}`);
   if (oldState.comments.issue !== newState.comments.issue)
@@ -153,19 +165,21 @@ function printChanges(oldState, newState) {
     changes.push(`- Review comments: ${oldState.comments.review} -> ${newState.comments.review}`);
 
   const oldMap = {};
-  for (const c of oldState.checks) oldMap[`${c.workflow}|${c.name}`] = c.state;
+  for (const c of oldState.checks) oldMap[`${c.workflow}|${c.name}`] = { state: c.state, link: c.link };
   const newMap = {};
-  for (const c of newState.checks) newMap[`${c.workflow}|${c.name}`] = c.state;
+  for (const c of newState.checks) newMap[`${c.workflow}|${c.name}`] = { state: c.state, link: c.link };
 
   const allKeys = [...new Set([...Object.keys(oldMap), ...Object.keys(newMap)])].sort();
   for (const key of allKeys) {
-    const os = oldMap[key] || 'missing';
-    const ns = newMap[key] || 'missing';
+    const os = oldMap[key]?.state || 'missing';
+    const ns = newMap[key]?.state || 'missing';
     if (os !== ns) {
       const [workflow, name] = key.split('|');
-      changes.push(workflow
-        ? `- Check [${workflow} / ${name}]: ${os} -> ${ns}`
-        : `- Check [${name}]: ${os} -> ${ns}`);
+      const label = workflow ? `${workflow} / ${name}` : name;
+      changes.push(`- Check [${label}]: ${os} -> ${ns}`);
+      if (ns === 'FAILURE' && newMap[key]?.link) {
+        changes.push(`  ${newMap[key].link}`);
+      }
     }
   }
 
@@ -242,34 +256,47 @@ function fetchAndPrintNewComments(prNumber, repo, sinceDate) {
  */
 function watchChecksViaGh(prNumber, baselineChecks) {
   return new Promise((resolve) => {
-    const child = spawn('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('close', (code) => {
-      if (code !== 0 && stderr) {
-        console.error(`gh pr checks --watch exited with code ${code}: ${stderr.trim()}`);
-      }
-      const currentChecks = fetchChecks(prNumber);
-      if (checksDiffer(baselineChecks, currentChecks)) {
-        resolve({ source: 'checks', code, checks: currentChecks });
-      }
-      // If unchanged, don't resolve — let comment polling handle it
-    });
-    child.on('error', () => {
-      // gh pr checks --watch not available — never resolve, let comment polling handle it
-    });
-    watchChecksViaGh._child = child;
+    function spawnWatcher() {
+      const child = spawn('gh', ['pr', 'checks', String(prNumber), '--watch', '--fail-fast'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', d => { stderr += d; });
+      child.on('close', (code) => {
+        if (code !== 0 && stderr) {
+          console.error(`gh pr checks --watch exited with code ${code}: ${stderr.trim()}`);
+        }
+        const currentChecks = fetchChecks(prNumber);
+        if (checksDiffer(baselineChecks, currentChecks)) {
+          resolve({ source: 'checks', code, checks: currentChecks });
+        } else {
+          // Checks unchanged — new commit may not have spawned runs yet. Retry after a delay.
+          setTimeout(spawnWatcher, 5000);
+        }
+      });
+      child.on('error', () => {
+        // gh pr checks --watch not available — retry after delay
+        setTimeout(spawnWatcher, 10000);
+      });
+      watchChecksViaGh._child = child;
+    }
+    spawnWatcher();
   });
 }
 
-/** Polls comment counts until they change from baseline */
-function watchComments(prNumber, repo, baseline, intervalSeconds) {
+/** Polls comment counts and PR state until they change from baseline */
+function watchComments(prNumber, repo, baseline, intervalSeconds, baselinePrState) {
   return new Promise(async (resolve) => {
     while (true) {
       await sleep(intervalSeconds);
       try {
+        // Check PR state (merged/closed)
+        const viewJson = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '--json', 'state']));
+        const currentPrState = viewJson.state || 'OPEN';
+        if (currentPrState !== (baselinePrState || 'OPEN')) {
+          resolve({ source: 'prState', prState: currentPrState });
+          return;
+        }
         const counts = fetchCommentCounts(prNumber, repo);
         if (counts.total !== baseline.total || counts.issue !== baseline.issue || counts.review !== baseline.review) {
           resolve({ source: 'comments', counts });
@@ -318,7 +345,8 @@ async function main() {
         fetchAndPrintNewComments(prNumber, repo, savedState.fetchedAt);
       }
       fs.writeFileSync(stateFile, JSON.stringify(currentState, null, 2));
-      process.exit(0);
+      if (!args.loop) process.exit(0);
+      console.log('');
     }
   }
 
@@ -329,30 +357,42 @@ async function main() {
   console.log(`PR: ${currentState.prUrl}`);
   console.log(`CI: using "gh pr checks --watch" (event-driven)`);
   console.log(`Comments: polling every ${args.interval}s`);
+  if (args.loop) console.log('Mode: continuous (--loop)');
   printSummary(currentState);
   console.log('');
 
   process.on('SIGINT', () => { cleanup(); process.exit(130); });
   process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
-  // Race: gh pr checks --watch vs comment polling
-  const result = await Promise.race([
-    watchChecksViaGh(prNumber, currentState.checks),
-    watchComments(prNumber, repo, currentState.comments, args.interval),
-  ]);
+  let baseState = currentState;
 
-  cleanup();
+  while (true) {
+    // Race: gh pr checks --watch vs comment polling
+    await Promise.race([
+      watchChecksViaGh(prNumber, baseState.checks),
+      watchComments(prNumber, repo, baseState.comments, args.interval, baseState.prState),
+    ]);
 
-  // Fetch full final state for accurate diff
-  const finalState = fetchState(prNumber, repo);
+    cleanup();
 
-  console.log(`Update detected at ${new Date().toISOString()}`);
-  printChanges(currentState, finalState);
-  if (finalState.comments.total > currentState.comments.total) {
-    fetchAndPrintNewComments(prNumber, repo, currentState.fetchedAt);
+    // Fetch full final state for accurate diff
+    const finalState = fetchState(prNumber, repo);
+
+    console.log(`Update detected at ${new Date().toISOString()}`);
+    printChanges(baseState, finalState);
+    if (finalState.comments.total > baseState.comments.total) {
+      fetchAndPrintNewComments(prNumber, repo, baseState.fetchedAt);
+    }
+    fs.writeFileSync(stateFile, JSON.stringify(finalState, null, 2));
+
+    // Don't exit if any check is still pending — keep watching for the final result
+    const hasPending = finalState.checks.some(c => c.state === 'PENDING');
+    if (!args.loop && !hasPending) process.exit(0);
+
+    if (hasPending) console.log('\nChecks still pending, continuing to watch...\n');
+    else console.log('\nContinuing to watch...\n');
+    baseState = finalState;
   }
-  fs.writeFileSync(stateFile, JSON.stringify(finalState, null, 2));
-  process.exit(0);
 }
 
 main().catch(e => {
